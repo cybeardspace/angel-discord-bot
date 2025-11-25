@@ -15,26 +15,31 @@ _config: Dict[str, Dict[str, Any]] = {}
 
 
 def load_config() -> None:
-    """Load per-guild configuration from disk."""
+    """Load configuration from disk."""
     global _config
-    if os.path.exists(CONFIG_FILE):
+    if not os.path.exists(CONFIG_FILE):
+        _config = {}
+        return
+    try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            try:
-                _config = json.load(f)
-            except json.JSONDecodeError:
-                _config = {}
-    else:
+            _config = json.load(f)
+    except Exception:
         _config = {}
 
 
 def save_config() -> None:
-    """Save per-guild configuration to disk."""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(_config, f, indent=2)
+    """Persist configuration to disk."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(_config, f, indent=2)
+    except Exception:
+        # In a safety-helper bot, failing to save config should fail silently,
+        # not crash the entire bot.
+        pass
 
 
 def get_guild_config(guild_id: int) -> Dict[str, Any]:
-    """Return the config dict for a guild, creating defaults if needed."""
+    """Return a config dict for the given guild, creating default if needed."""
     gid = str(guild_id)
     if gid not in _config:
         _config[gid] = {
@@ -72,7 +77,14 @@ def is_manager(interaction: discord.Interaction) -> bool:
     if not isinstance(user, discord.Member):
         return False
 
-    return any(role.id in manager_role_ids for role in user.roles)
+    # Harden this against weird / partial member data:
+    # - user.roles might be None
+    # - entries in user.roles might be None or not a Role
+    roles = getattr(user, "roles", []) or []
+    return any(
+        isinstance(role, discord.Role) and role.id in manager_role_ids
+        for role in roles
+    )
 
 
 def manager_only():
@@ -90,18 +102,25 @@ def manager_only():
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # for guild.me, roles, etc.
+intents.members = True  # needed for role-based checks
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+)
+
+tree = bot.tree
 
 
 @bot.event
 async def on_ready():
-    load_config()
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
 
+    # Sync slash commands
     try:
-        await bot.tree.sync()
+        await tree.sync()
         print("Slash commands synced.")
     except Exception as e:
         print(f"Error syncing commands: {e}")
@@ -109,85 +128,45 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """
-    When the bot joins a new guild, create an 'angel' role for the BOT to use.
-
-    This role is for channel permission control (view/send/delete), NOT for human managers.
-    Human managers are configured separately with /angel_set_manager or /angel_setup.
-    """
-    load_config()  # refresh in case
-
-    # Check if role named 'angel' already exists (case-insensitive)
-    angel_role = None
-    for role in guild.roles:
-        if role.name.lower() == "angel":
-            angel_role = role
-            break
-
-    # If not, try to create it.
-    # We give it the permissions the bot needs in channels where this role is allowed:
-    # - view_channel, send_messages, read_message_history, manage_messages.
-    if angel_role is None:
-        perms = discord.Permissions(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_messages=True,
-        )
-        try:
-            angel_role = await guild.create_role(
+    """Try to create and assign an 'angel' role for the bot."""
+    try:
+        # Check if role already exists
+        role = discord.utils.get(guild.roles, name="angel")
+        if role is None:
+            role = await guild.create_role(
                 name="angel",
-                permissions=perms,
-                reason="Role for the Angel bot to control its channel permissions.",
+                reason="Role for angel safety bot",
             )
-            print(f"Created 'angel' role in guild {guild.name} ({guild.id}).")
-        except discord.Forbidden:
-            print(
-                f"Could not create 'angel' role in guild {guild.name} ({guild.id}) "
-                f"due to missing permissions."
-            )
-            angel_role = None
-        except Exception as e:
-            print(
-                f"Unexpected error creating 'angel' role in guild {guild.name} ({guild.id}): {e}"
-            )
-            angel_role = None
-
-    # Assign the angel role to the bot itself, if possible
-    if angel_role is not None:
-        try:
-            me: discord.Member = guild.me  # the bot's member object in this guild
-            if me is not None and angel_role not in me.roles:
-                await me.add_roles(
-                    angel_role,
-                    reason="Angel bot role for channel permissions.",
-                )
-                print(
-                    f"Assigned 'angel' role to bot in guild {guild.name} ({guild.id})."
-                )
-        except discord.Forbidden:
-            print(
-                f"Could not assign 'angel' role to bot in guild {guild.name} ({guild.id}) "
-                f"due to missing permissions."
-            )
-        except Exception as e:
-            print(
-                f"Unexpected error assigning 'angel' role to bot in guild {guild.name} ({guild.id}): {e}"
-            )
+        # Assign the role to the bot, if we see our own Member
+        me = guild.me  # type: ignore[attr-defined]
+        if me and role not in me.roles:
+            await me.add_roles(role, reason="Granting angel bot role")
+    except discord.Forbidden:
+        # No perms to manage roles; fine, server owner can sort it out.
+        pass
+    except Exception:
+        pass
 
 
 # ==============================
-# CORE ALERT HANDLER
+# CORE SAFEWORD COMMAND
 # ==============================
 
-async def angel_alert(interaction: discord.Interaction, message: str | None):
-    """Core logic for sending an alert to mods."""
+@tree.command(name="angel", description="Quietly request help from trusted moderators.")
+@app_commands.describe(
+    message="Optional context about what you need help with."
+)
+async def angel_command(interaction: discord.Interaction, message: str = ""):
+    """
+    Main safeword command.
+    - User runs /angel in the intake channel.
+    - Bot acks ephemerally.
+    - Bot posts to mod-channel with context + link to user.
+    """
     guild = interaction.guild
-    channel = interaction.channel
-
-    if guild is None or channel is None:
+    if guild is None:
         await interaction.response.send_message(
-            "This command can only be used inside a server channel.",
+            "This command can only be used in a server.",
             ephemeral=True,
         )
         return
@@ -196,182 +175,59 @@ async def angel_alert(interaction: discord.Interaction, message: str | None):
     intake_channel_id = cfg.get("intake_channel_id")
     mod_channel_id = cfg.get("mod_channel_id")
 
-    # Must have a mod channel configured
-    if not mod_channel_id:
+    # Check that the command is run in the correct channel (if configured).
+    if intake_channel_id is not None and interaction.channel_id != intake_channel_id:
         await interaction.response.send_message(
-            "The alert system is not fully configured yet. "
-            "Please let a moderator know.",
+            "This isn't the right place to use /angel. "
+            "Use it in the designated intake channel.",
             ephemeral=True,
         )
         return
 
-    # If an intake channel is configured, enforce it
-    if intake_channel_id and channel.id != intake_channel_id:
-        await interaction.response.send_message(
-            "This isn’t the right place to use that command.\n"
-            "Please use it in the designated help channel.",
-            ephemeral=True,
-        )
-        return
-
-    user = interaction.user
-
-    # Capture identity info as PLAIN TEXT so it survives if they leave
-    raw_id = user.id
-    base_username = user.name
-
-    if hasattr(user, "discriminator") and user.discriminator not in (None, "", "0"):
-        classic_username = f"{user.name}#{user.discriminator}"
-    else:
-        classic_username = user.name
-
-    global_name = getattr(user, "global_name", None)
-    display_name = getattr(user, "display_name", user.name)
-
-    content = message.strip() if message else "(no message)"
-
-    # Build log text
-    log_lines = [
-        "🚨 /angel alert triggered",
-        f"Guild: {guild.name} (ID: {guild.id})",
-        "",
-        f"User ID: {raw_id}",
-        f"Base username: {base_username}",
-        f"Classic username: {classic_username}",
-        f"Global name at time of alert: {global_name if global_name else '(none)'}",
-        f"Server display name at time of alert: {display_name}",
-        "",
-        f"Channel: #{channel.name} (ID: {channel.id})",
-        "",
-        "Message:",
-        content,
-    ]
-    log_text = "\n".join(log_lines)
-
-    mod_channel = bot.get_channel(mod_channel_id)
-
-    if mod_channel is None:
-        await interaction.response.send_message(
-            "Something went wrong notifying the moderators. "
-            "Please tell a moderator if you can.",
-            ephemeral=True,
-        )
-        return
-
-    # Send alert to mods
-    await mod_channel.send(log_text)
-
-    # Try to clean up any visible trace in the channel (best-effort; slash commands usually don't leave a normal message)
+    # Always acknowledge to the user first, ephemerally.
     try:
-        if isinstance(channel, discord.TextChannel):
-            msg = await channel.fetch_message(interaction.id)
-            await msg.delete()
-    except Exception:
+        await interaction.response.send_message(
+            "Your request has been quietly sent to the moderators. Someone will reach out soon.",
+            ephemeral=True,
+        )
+    except discord.InteractionResponded:
+        # In case something already responded, just skip.
         pass
 
-    # Ephemeral confirmation (viewer-only, dismissable)
-    await interaction.response.send_message(
-        "Your alert has been sent to the moderation team.\n"
-        "Nothing from this command is visible to others in the channel.\n"
-        "This message is only visible to you.",
-        ephemeral=True,
-    )
+    # If mod channel is configured, post there with context.
+    if mod_channel_id is not None:
+        channel = guild.get_channel(mod_channel_id)
+        if isinstance(channel, discord.TextChannel):
+            embed = discord.Embed(
+                title="🚨 Angel Safeword Triggered",
+                description=(
+                    f"User: {interaction.user.mention}\n"
+                    f"Channel: {interaction.channel.mention if interaction.channel else 'Unknown'}\n"
+                ),
+                color=discord.Color.red(),
+            )
+            if message:
+                embed.add_field(name="Message", value=message, inline=False)
+
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                # Can't post to mod channel, nothing else to do quietly
+                pass
 
 
 # ==============================
-# /angel — alert
+# ADMIN / MANAGER COMMANDS
 # ==============================
 
-@bot.tree.command(
-    name="angel",
-    description="Send a quiet alert to the moderation team."
-)
-@app_commands.describe(
-    message="Optional short message for the moderators (can be left empty)."
-)
-async def angel_root(interaction: discord.Interaction, message: str | None = None):
-    """Always behave as the alert command, for all users."""
-    await angel_alert(interaction, message)
-
-
-# ==============================
-# /angel_info
-# ==============================
-
-@bot.tree.command(
-    name="angel_info",
-    description="Show information about the Angel alert system."
-)
-async def angel_info(interaction: discord.Interaction):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message(
-            "This command can only be used inside a server.",
-            ephemeral=True,
-        )
-        return
-
-    cfg = get_guild_config(guild.id)
-    intake_id = cfg.get("intake_channel_id")
-    mod_id = cfg.get("mod_channel_id")
-
-    intake_text = f"<#{intake_id}>" if intake_id else "(not set)"
-    mod_text = f"<#{mod_id}>" if mod_id else "(not set)"
-
-    user_help = (
-        "**Angel Alert System**\n"
-        "This system provides a quiet way to alert the moderation team.\n\n"
-        "**To send an alert:**\n"
-        "`/angel` — sends an alert with no text.\n"
-        "`/angel message: <text>` — sends an alert with a short message.\n\n"
-        "**What happens:**\n"
-        "• Your alert goes directly to the mod team.\n"
-        "• The command leaves no public trace in the channel.\n"
-        "• You get a private confirmation message only you can see.\n"
-    )
-
-    if is_manager(interaction):
-        manager_help = (
-            "\n**Current configuration (you have manager permissions):**\n"
-            f"• Intake channel: {intake_text}\n"
-            f"• Mod alert channel: {mod_text}\n\n"
-            "**Manager commands:**\n"
-            "`/angel_set_intake <channel>`\n"
-            "`/angel_set_logs <channel>`\n"
-            "`/angel_set_manager <role>`\n"
-            "`/angel_setup <intake> <logs> <manager role>`\n"
-        )
-        await interaction.response.send_message(
-            user_help + manager_help,
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            user_help,
-            ephemeral=True,
-        )
-
-
-# ==============================
-# MANAGEMENT COMMANDS
-# ==============================
-
-@bot.tree.command(
-    name="angel_set_intake",
-    description="Set the channel where /angel may be used."
-)
+@tree.command(name="angel_set_intake", description="Set the intake channel for /angel requests.")
 @manager_only()
-@app_commands.describe(
-    channel="Channel where users will run /angel."
-)
-async def angel_set_intake(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-):
+@app_commands.describe(channel="Channel where users should run /angel.")
+async def angel_set_intake(interaction: discord.Interaction, channel: discord.TextChannel):
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
-            "This command can only be used inside a server.",
+            "This command can only be used in a server.",
             ephemeral=True,
         )
         return
@@ -381,27 +237,19 @@ async def angel_set_intake(
     save_config()
 
     await interaction.response.send_message(
-        f"Intake channel set to #{channel.name} (ID: {channel.id}).",
+        f"Intake channel set to {channel.mention}.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(
-    name="angel_set_logs",
-    description="Set the mod channel where alerts are sent."
-)
+@tree.command(name="angel_set_logs", description="Set the moderator log channel for Angel alerts.")
 @manager_only()
-@app_commands.describe(
-    channel="Channel where mod alerts will be sent."
-)
-async def angel_set_logs(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-):
+@app_commands.describe(channel="Channel where Angel should post alerts for moderators.")
+async def angel_set_logs(interaction: discord.Interaction, channel: discord.TextChannel):
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
-            "This command can only be used inside a server.",
+            "This command can only be used in a server.",
             ephemeral=True,
         )
         return
@@ -411,51 +259,56 @@ async def angel_set_logs(
     save_config()
 
     await interaction.response.send_message(
-        f"Mod alert / logs channel set to #{channel.name} (ID: {channel.id}).",
+        f"Moderator log channel set to {channel.mention}.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(
-    name="angel_set_manager",
-    description="Set the role allowed to manage Angel settings."
-)
+@tree.command(name="angel_set_manager", description="Add or remove human roles allowed to manage Angel.")
 @manager_only()
 @app_commands.describe(
-    role="Human role that can manage Angel settings."
+    role="The role to grant or revoke Angel manager permissions.",
+    allow="Whether this role should be allowed to manage Angel (True) or disallowed (False).",
 )
-async def angel_set_manager_role(
+async def angel_set_manager(
     interaction: discord.Interaction,
     role: discord.Role,
+    allow: bool,
 ):
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
-            "This command can only be used inside a server.",
+            "This command can only be used in a server.",
             ephemeral=True,
         )
         return
 
     cfg = get_guild_config(guild.id)
-    cfg["manager_role_ids"] = [role.id]
+    manager_role_ids = cfg.get("manager_role_ids", [])
+
+    if allow:
+        if role.id not in manager_role_ids:
+            manager_role_ids.append(role.id)
+    else:
+        if role.id in manager_role_ids:
+            manager_role_ids.remove(role.id)
+
+    cfg["manager_role_ids"] = manager_role_ids
     save_config()
 
+    verb = "now allowed to" if allow else "no longer allowed to"
     await interaction.response.send_message(
-        f"Manager role set to @{role.name} (ID: {role.id}).\n"
-        "Guild owner and users with Manage Server are always allowed as well.",
+        f"Role {role.mention} is {verb} manage Angel settings.",
         ephemeral=True,
     )
 
 
-@bot.tree.command(
-    name="angel_setup",
-    description="Run full Angel setup: intake, logs, and manager role."
-)
+@tree.command(name="angel_setup", description="Interactive-ish setup for Angel (intake, logs, managers).")
 @manager_only()
 @app_commands.describe(
-    intake_channel="Channel where users will run /angel.",
-    mod_channel="Channel where alerts should be sent for mods.",
-    manager_role="Human role that can manage Angel settings.",
+    intake_channel="Channel where users will invoke /angel.",
+    mod_channel="Channel where Angel will notify moderators.",
+    manager_role="Role that should be allowed to manage Angel settings.",
 )
 async def angel_setup(
     interaction: discord.Interaction,
@@ -466,7 +319,7 @@ async def angel_setup(
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message(
-            "This command can only be used inside a server.",
+            "This command can only be used in a server.",
             ephemeral=True,
         )
         return
@@ -474,16 +327,56 @@ async def angel_setup(
     cfg = get_guild_config(guild.id)
     cfg["intake_channel_id"] = intake_channel.id
     cfg["mod_channel_id"] = mod_channel.id
-    cfg["manager_role_ids"] = [manager_role.id]
+
+    manager_role_ids = cfg.get("manager_role_ids", [])
+    if manager_role.id not in manager_role_ids:
+        manager_role_ids.append(manager_role.id)
+    cfg["manager_role_ids"] = manager_role_ids
+
     save_config()
 
     await interaction.response.send_message(
-        "Angel setup completed:\n"
-        f"• Intake channel: #{intake_channel.name} (ID: {intake_channel.id})\n"
-        f"• Mod alert channel: #{mod_channel.name} (ID: {mod_channel.id})\n"
-        f"• Manager role: @{manager_role.name} (ID: {manager_role.id})",
+        (
+            "Angel setup complete:\n"
+            f"- Intake channel: {intake_channel.mention}\n"
+            f"- Mod log channel: {mod_channel.mention}\n"
+            f"- Manager role added: {manager_role.mention}"
+        ),
         ephemeral=True,
     )
+
+
+# ==============================
+# ERROR HANDLING
+# ==============================
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            await interaction.response.send_message(
+                "You are not allowed to use this command.",
+                ephemeral=True,
+            )
+        except discord.InteractionResponded:
+            await interaction.followup.send(
+                "You are not allowed to use this command.",
+                ephemeral=True,
+            )
+        return
+
+    # Generic error: keep it vague to the user, log to console.
+    print(f"App command error in {interaction.command}: {error!r}")
+    try:
+        await interaction.response.send_message(
+            "Something went wrong while running that command.",
+            ephemeral=True,
+        )
+    except discord.InteractionResponded:
+        await interaction.followup.send(
+            "Something went wrong while running that command.",
+            ephemeral=True,
+        )
 
 
 # ==============================
