@@ -1,165 +1,200 @@
 # Angel – Quiet Alert Bot for Discord
 
-Angel is a small, privacy-focused Discord bot that gives people a **quiet way to alert moderators** when they might be in danger or in a high-risk situation (e.g., domestic abuse, stalking, unsafe home environments).
-
-It is **not** a replacement for emergency services, legal advice, or professional counseling. It’s just a tiny, careful piece of infrastructure: a panic cord that pings your mod team.
+Angel is a privacy-focused Discord bot that gives people a quiet, low-visibility way to alert moderators when they feel unsafe or are in a high-risk situation. It’s not a substitute for emergency services or professional help; it’s a discreet panic line for trusted staff.
 
 ---
 
 ## What Angel Does
 
-- Provides a **single user command**:
+• Provides one user command:  
+    /angel  
+    /angel message:<text>
 
-  - `/angel` – sends an alert with no text.  
-  - `/angel message: <text>` – sends an alert with a short note.
+• Sends a detailed embed to the configured moderator log channel.  
+• Stores the user’s information in plain text (not only mentions).  
+• Sends the user an ephemeral confirmation.  
+• Leaves no visible message in channels.  
+• Supports multiple servers, each with its own saved configuration.
 
-- For each alert:
-
-  - Sends a detailed log to a **mod-only channel**.
-  - Stores the user’s name(s) and ID as plain **text** (not just a mention), so the alert is still readable even if they leave or get forced out.
-  - Leaves no public trace in the channel (slash commands are invisible by default; the bot also tries to delete any fallback message).
-  - Sends an **ephemeral confirmation** only the user can see.
-
-- Supports **multiple servers**: each guild has its own configuration.
+Configuration is stored in angel_config.json.
 
 ---
 
-## Commands
+## User Command
 
-### User commands
+### /angel
 
-- `/angel`  
-  Send a quiet alert to the moderation team.  
+Users can quietly request help.
 
-  - `/angel` → alert with “(no message)”  
-  - `/angel message: I only have a second` → alert with text  
+Behavior:
 
-- `/angel_info`  
-  Shows a short explanation of how Angel works.  
-  If you’re a manager, it also shows the current config and admin commands.
+• /angel with no message → alert with an empty message.  
+• /angel message:<text> → includes the message in the embed.  
+• If an intake channel is set, /angel only works there.  
+• Used elsewhere → ephemeral “wrong channel” message.  
+• Used correctly → ephemeral confirmation + embed sent to mods.
 
 ---
 
-### Manager/admin commands
+## Manager / Admin Commands
 
-Angel’s idea of “manager”:
+Angel considers the following as managers:
 
-- server owner, or  
-- anyone with “Manage Server”, or  
-- anyone with a role set via `/angel_set_manager`.
+• Server owner  
+• Anyone with the Manage Server permission  
+• Anyone with a role designated as a manager role
 
-Commands:
+---
 
-- `/angel_setup intake_channel:#channel mod_channel:#channel manager_role:@Role`  
-  One-shot setup for the server:
+### /angel_setup
 
-  - intake channel = where users are allowed to run `/angel`  
-  - mod channel = where Angel sends alerts  
-  - manager role = human role allowed to configure Angel
+    /angel_setup intake_channel:#channel mod_channel:#channel manager_role:@Role
 
-- `/angel_set_intake #channel`  
-  Set the intake channel where `/angel` may be used.
+Sets core configuration:
 
-- `/angel_set_logs #channel`  
-  Set the mod log/alert channel for incoming alerts.
+• intake channel  
+• mod-log channel  
+• designated manager role  
 
-- `/angel_set_manager @role`  
-  Choose which **human** role can manage Angel’s settings.
+Adds the manager role to the list of allowed manager roles.
+
+---
+
+### /angel_set_intake
+
+    /angel_set_intake channel:#channel
+
+Sets which channel users must use for /angel.
+
+---
+
+### /angel_set_logs
+
+    /angel_set_logs channel:#channel
+
+Sets the moderator channel where Angel posts alert embeds.
+
+---
+
+### /angel_set_manager
+
+    /angel_set_manager role:@Role allow:true
+    /angel_set_manager role:@Role allow:false
+
+Adds or removes a human role from the manager list.
+
+Notes:
+
+• Server owner + Manage Server users are always managers.  
+• Manager roles only apply to human roles, not the bot role.
+
+---
+
+## Alert Embed Fields
+
+Angel’s alert embed contains:
+
+• User mention  
+• Plain username  
+• Display name  
+• User ID  
+• Channel used  
+• Message text (if provided)
+
+Plain username ensures logs remain readable if the user leaves the server.
 
 ---
 
 ## Roles and Permissions
 
-Angel distinguishes two things:
+Angel distinguishes two types:
 
-### 1. Bot role – `@angel`
+### Bot Role – @angel
 
-- Created **automatically** when the bot joins a server (if it doesn’t already exist).
-- Assigned to the bot only.
-- Given base guild-level permissions:
+• Auto-created when the bot joins a server.  
+• Should have access only to:  
+    intake channel  
+    mod-log channel  
+• Needs permissions:  
+    View Channel  
+    Send Messages  
+    Read Message History  
+    Manage Messages  
 
-  - View Channels  
-  - Send Messages  
-  - Read Message History  
-  - Manage Messages  
+### Manager Roles – Human
 
-Server owners should then **control where** the `@angel` role is allowed via channel permission overwrites:
+• Defined via /angel_setup or /angel_set_manager.  
+• Hold management authority over Angel’s settings.
 
-- Give `@angel` access only to:
-  - the intake channel (e.g., `#project-angel`), and
-  - the mod alert/log channel.
+---
 
-### 2. Manager role – human
+## Config Storage
 
-- Selected via `/angel_set_manager` or `/angel_setup`.
-- Any existing role (e.g., `@Moderator`, `@Admin`).
-- People with this role can run:
+angel_config.json contains per-guild:
 
-  - `/angel_setup`  
-  - `/angel_set_intake`  
-  - `/angel_set_logs`  
-  - `/angel_set_manager`  
-  - and they see extra info in `/angel_info`.
+• intake_channel_id  
+• mod_channel_id  
+• manager_role_ids  
+
+It is loaded at startup and updated whenever settings change.  
+.gitignore already excludes the file from source control.
 
 ---
 
 ## Discord Application Setup
 
-You only do this **once**, in the Discord Developer Portal.
+In the Discord Developer Portal:
 
-1. Go to: https://discord.com/developers/applications  
-2. Click “New Application” → name it (e.g. “AngelBot”).  
-3. Go to **Bot** tab:
-   - Click “Add Bot”.
-   - Under **Privileged Gateway Intents**, enable:
-     - `SERVER MEMBERS INTENT`.
-   - Under **Bot Permissions**, enable at least:
-     - ✅ View Channels  
-     - ✅ Send Messages  
-     - ✅ Read Message History  
-     - ✅ Manage Messages  
+1. Create an application.  
+2. Add a bot to it.  
+3. Enable SERVER MEMBERS INTENT.  
+4. Grant the bot these permissions:  
+    View Channels  
+    Send Messages  
+    Read Message History  
+    Manage Messages  
+5. Under OAuth2 → URL Generator:  
+    Scopes: bot, applications.commands  
+    Same permissions as above  
+6. Use the generated link to invite Angel to your server.
 
-4. Go to **OAuth2 → URL Generator**:
-   - Scopes:
-     - ✅ `bot`  
-     - ✅ `applications.commands`
-   - Under **Bot Permissions**, again select:
-     - ✅ View Channels  
-     - ✅ Send Messages  
-     - ✅ Read Message History  
-     - ✅ Manage Messages  
-
-   Copy the generated invite URL.
-
-5. Use that URL to **invite Angel** to any server.
-
-When Angel joins a server, it will:
-
-- auto-create an `@angel` role (if needed),  
-- assign that role to itself,  
-- then wait for you to configure channels/manager.
+When joining a server, Angel creates and assigns its @angel role if needed.
 
 ---
 
 ## Per-Server Setup
 
-Once Angel is in a server:
+After inviting Angel:
 
-1. Decide on:
-   - An **intake channel** (where users will run `/angel`, e.g. `#project-angel`).  
-   - A **mod alert/log channel** (e.g. `#mod-angel-alerts`).  
-   - A **manager role** (e.g. `@Moderator`).
+1. Choose an intake channel and a mod-log channel.  
+2. Assign @angel access only to those two channels.  
+3. Choose a manager role.  
+4. Run:
 
-2. In Discord channel permissions:
+        /angel_setup intake_channel:#intake mod_channel:#modlogs manager_role:@Moderator
 
-   For the intake + mod channels, give the `@angel` role:
+5. Test /angel in the intake channel — user sees an ephemeral confirmation, mods see an embed.
 
-   - View Channel  
-   - Send Messages  
-   - Read Message History  
-   - Manage Messages (recommended so Angel can delete any visible traces)
+---
 
-3. As server owner, or someone with “Manage Server” (or your chosen manager role), run:
+## Running Angel
 
-   ```text
-   /angel_setup intake_channel:#project-angel mod_channel:#mod-angel-alerts manager_role:@Moderator
+Angel expects the environment variable:
+
+    DISCORD_BOT_TOKEN
+
+Startup example:
+
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install -r requirements.txt
+    export DISCORD_BOT_TOKEN="your-token"
+    python angel.py
+
+requirements.txt contains:
+
+    discord.py==2.4.0
+
+---
+
+Angel’s purpose is simple: create a quiet, evidence-preserving line of communication that helps protect people without exposing them to additional risk.
