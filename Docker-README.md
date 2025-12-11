@@ -1,4 +1,3 @@
-````markdown
 # Angel Discord Bot: Docker Deployment Guide
 
 This guide provides instructions for building and running the Angel Discord Bot using Docker Compose.
@@ -73,5 +72,3 @@ docker compose down -v
 ```
 
 *Note: The `-v` flag is critical for deleting the persistent volume.*
-
-````
